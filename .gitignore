@@ -1,0 +1,4 @@
+.DS_Store
+.build/
+WallpaperVideo.app/
+.claude/settings.local.json
