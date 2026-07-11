@@ -3,6 +3,7 @@ import AVFoundation
 import ServiceManagement
 import UniformTypeIdentifiers
 import CryptoKit
+import WebKit
 
 // MARK: - Desktop-level window that hosts the video
 
@@ -28,9 +29,46 @@ final class PlayerView: NSView {
     }
 }
 
+// Desktop-level windows never become key, so every click arrives as a
+// "first mouse" — accept it or clicks would be swallowed
+final class WallpaperWebView: WKWebView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 enum TranscodeError: Error {
     case ffmpegNotFound
     case ffmpegFailed
+}
+
+// MARK: - Playlist model
+
+struct PlaylistItem: Codable {
+    let path: String
+    var name: String {
+        URL(fileURLWithPath: path).lastPathComponent
+    }
+}
+
+// MARK: - Interval options
+
+enum SwitchInterval: Int, CaseIterable {
+    case off     = 0
+    case min1    = 60
+    case min5    = 300
+    case min15   = 900
+    case min30   = 1800
+    case hour1   = 3600
+
+    var label: String {
+        switch self {
+        case .off:    "끄기 (한곡만)"
+        case .min1:   "1분"
+        case .min5:   "5분"
+        case .min15:  "15분"
+        case .min30:  "30분"
+        case .hour1:  "1시간"
+        }
+    }
 }
 
 // MARK: - App delegate
@@ -39,13 +77,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var window: DesktopWindow!
     private var playerView: PlayerView!
-    private var queuePlayer: AVQueuePlayer!
+    private var player: AVQueuePlayer?
     private var looper: AVPlayerLooper?
     private var isPlaying = false
+    private var webView: WKWebView?
+    private var showingHTML = false
+    private var htmlInteraction = true
 
-    private let defaultsKey = "WallpaperVideoPath"
+    private let playlistKey = "WallpaperPlaylist"
+    private let currentIndexKey = "WallpaperCurrentIndex"
+    private let intervalKey = "WallpaperSwitchInterval"
+    private let shuffleKey = "WallpaperShuffle"
+    private let htmlInteractionKey = "WallpaperHTMLInteraction"
+
+    private var playlist: [PlaylistItem] = []
+    private var currentIndex = 0
+    private var switchInterval: SwitchInterval = .off
+    private var shuffle = false
+    private var switchTimer: Timer?
+
+    private var shuffledOrder: [Int] = []
+    private var shuffleIndex = 0
+
+    // Menu item references for dynamic updates
+    private weak var playlistMenu: NSMenu?
+    private weak var intervalMenu: NSMenu?
+    private weak var toggleMenuItem: NSMenuItem?
+    private weak var nowPlayingItem: NSMenuItem?
+
+    // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        loadState()
         setupStatusItem()
         setupDesktopWindow()
 
@@ -56,12 +119,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        if let savedPath = UserDefaults.standard.string(forKey: defaultsKey) {
-            handleSelectedVideo(url: URL(fileURLWithPath: savedPath))
+        if !playlist.isEmpty {
+            loadVideo(at: currentIndex)
         }
     }
 
-    // MARK: Status bar menu
+    private func loadState() {
+        if let data = UserDefaults.standard.data(forKey: playlistKey),
+           let items = try? JSONDecoder().decode([PlaylistItem].self, from: data) {
+            playlist = items
+        }
+        currentIndex = UserDefaults.standard.integer(forKey: currentIndexKey)
+        if currentIndex >= playlist.count { currentIndex = 0 }
+        let raw = UserDefaults.standard.integer(forKey: intervalKey)
+        switchInterval = SwitchInterval(rawValue: raw) ?? .off
+        shuffle = UserDefaults.standard.bool(forKey: shuffleKey)
+        if UserDefaults.standard.object(forKey: htmlInteractionKey) != nil {
+            htmlInteraction = UserDefaults.standard.bool(forKey: htmlInteractionKey)
+        }
+    }
+
+    private func saveState() {
+        if let data = try? JSONEncoder().encode(playlist) {
+            UserDefaults.standard.set(data, forKey: playlistKey)
+        }
+        UserDefaults.standard.set(currentIndex, forKey: currentIndexKey)
+    }
+
+    private func saveInterval() {
+        UserDefaults.standard.set(switchInterval.rawValue, forKey: intervalKey)
+    }
+
+    private func saveShuffle() {
+        UserDefaults.standard.set(shuffle, forKey: shuffleKey)
+    }
+
+    // MARK: - Status bar menu
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -73,18 +166,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             statusItem.button?.image = NSImage(systemSymbolName: "play.rectangle", accessibilityDescription: "Wallpaper Video")
         }
+        buildMenu()
+    }
 
+    private func buildMenu() {
         let menu = NSMenu()
-        menu.addItem(withTitle: "비디오 선택...", action: #selector(chooseVideo), keyEquivalent: "o").target = self
+        menu.autoenablesItems = false
+
+        // Now playing
+        let nowPlaying = NSMenuItem(title: nowPlayingText(), action: nil, keyEquivalent: "")
+        nowPlaying.isEnabled = false
+        nowPlayingItem = nowPlaying
+        menu.addItem(nowPlaying)
         menu.addItem(NSMenuItem.separator())
 
-        let toggleItem = NSMenuItem(title: "일시정지", action: #selector(togglePlayback), keyEquivalent: "p")
-        toggleItem.target = self
-        menu.addItem(toggleItem)
+        // Interval submenu
+        let intervalItem = NSMenuItem(title: "⏱ 전환 간격", action: nil, keyEquivalent: "")
+        let intervalSub = NSMenu()
+        intervalSub.autoenablesItems = false
+        for interval in SwitchInterval.allCases {
+            let item = NSMenuItem(title: interval.label, action: #selector(setInterval(_:)), keyEquivalent: "")
+            item.representedObject = interval.rawValue
+            item.state = interval == switchInterval ? .on : .off
+            item.target = self
+            intervalSub.addItem(item)
+        }
+        intervalItem.submenu = intervalSub
+        intervalMenu = intervalSub
+        menu.addItem(intervalItem)
+
+        // Shuffle toggle
+        let shuffleItem = NSMenuItem(title: shuffle ? "🔀 셔플 켜짐" : "🔀 셔플 꺼짐", action: #selector(toggleShuffle), keyEquivalent: "")
+        shuffleItem.target = self
+        menu.addItem(shuffleItem)
+
+        // HTML interaction toggle
+        let interactionItem = NSMenuItem(title: "🖱 HTML 상호작용", action: #selector(toggleHTMLInteraction), keyEquivalent: "")
+        interactionItem.target = self
+        interactionItem.state = htmlInteraction ? .on : .off
+        menu.addItem(interactionItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        let loginItem = NSMenuItem(title: "로그인 시 자동 실행", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        // Playlist header + items
+        let playlistHeader = NSMenuItem(title: "📋 플레이리스트 (\(playlist.count))", action: nil, keyEquivalent: "")
+        playlistHeader.isEnabled = false
+        menu.addItem(playlistHeader)
+
+        let playlistSub = NSMenu()
+        playlistSub.autoenablesItems = false
+        if playlist.isEmpty {
+            let emptyItem = NSMenuItem(title: "   (비어있음)", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            playlistSub.addItem(emptyItem)
+        } else {
+            for (i, item) in playlist.enumerated() {
+                let title = i == currentIndex ? "▶ \(item.name)" : "  \(item.name)"
+                let menuItem = NSMenuItem(title: title, action: #selector(selectPlaylistItem(_:)), keyEquivalent: "")
+                menuItem.representedObject = i
+                menuItem.target = self
+                playlistSub.addItem(menuItem)
+            }
+        }
+        playlistSub.addItem(NSMenuItem.separator())
+        let addItem = NSMenuItem(title: "➕ 비디오/HTML 추가...", action: #selector(addVideo), keyEquivalent: "o")
+        addItem.target = self
+        playlistSub.addItem(addItem)
+        let removeItem = NSMenuItem(title: "🗑 현재 곡 삭제", action: #selector(removeCurrent), keyEquivalent: "\u{8}")
+        removeItem.target = self
+        removeItem.isEnabled = !playlist.isEmpty
+        playlistSub.addItem(removeItem)
+        let clearItem = NSMenuItem(title: "🗑 전체 삭제", action: #selector(clearPlaylist), keyEquivalent: "")
+        clearItem.target = self
+        clearItem.isEnabled = !playlist.isEmpty
+        playlistSub.addItem(clearItem)
+
+        let playlistMenuItem = NSMenuItem(title: "플레이리스트 편집", action: nil, keyEquivalent: "")
+        playlistMenuItem.submenu = playlistSub
+        playlistMenu = playlistSub
+        menu.addItem(playlistMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Playback control
+        let toggle = NSMenuItem(title: isPlaying ? "⏸ 일시정지" : "▶ 재생", action: #selector(togglePlayback), keyEquivalent: "p")
+        toggle.target = self
+        toggle.isEnabled = !showingHTML
+        toggleMenuItem = toggle
+        menu.addItem(toggle)
+
+        let nextItem = NSMenuItem(title: "⏭ 다음 곡", action: #selector(nextTrack), keyEquivalent: "n")
+        nextItem.target = self
+        nextItem.isEnabled = playlist.count > 1
+        menu.addItem(nextItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Login item
+        let loginItem = NSMenuItem(title: "🔒 로그인 시 자동 실행", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(loginItem)
@@ -95,15 +274,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private var loginMenuItem: NSMenuItem? {
-        statusItem.menu?.item(withTitle: "로그인 시 자동 실행")
+    private func rebuildMenu() {
+        buildMenu()
     }
 
-    private var toggleMenuItem: NSMenuItem? {
-        statusItem.menu?.item(withTitle: "일시정지") ?? statusItem.menu?.item(withTitle: "재생")
+    private func nowPlayingText() -> String {
+        guard !playlist.isEmpty else { return "🎬 선택된 영상 없음" }
+        let name = playlist[currentIndex].name
+        let total = playlist.count
+        return "▶ \(name) (\(currentIndex+1)/\(total))"
     }
 
-    // MARK: Desktop window
+    // MARK: - Desktop window
 
     private func setupDesktopWindow() {
         guard let screen = NSScreen.main else { return }
@@ -122,11 +304,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isOpaque = true
         window.backgroundColor = .black
         window.ignoresMouseEvents = true
+        window.acceptsMouseMovedEvents = true // hover effects in HTML wallpapers
         window.hasShadow = false
 
-        playerView = PlayerView(frame: screen.frame)
+        // Container holds playerView and webView as siblings so hiding one
+        // never hides the other
+        let container = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        playerView = PlayerView(frame: container.bounds)
         playerView.autoresizingMask = [.width, .height]
-        window.contentView = playerView
+        container.addSubview(playerView)
+        window.contentView = container
 
         window.orderFrontRegardless()
     }
@@ -136,49 +323,274 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrame(screen.frame, display: true)
     }
 
-    // MARK: Actions
+    // MARK: - Playlist management
 
-    @objc private func chooseVideo() {
+    @objc private func addVideo() {
         let panel = NSOpenPanel()
-        panel.title = "배경화면으로 사용할 비디오 선택"
-        panel.allowsMultipleSelection = false
+        panel.title = "배경화면으로 사용할 비디오/HTML 선택"
+        panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        var contentTypes: [UTType] = [.movie, .mpeg4Movie, .quickTimeMovie]
+        var contentTypes: [UTType] = [.movie, .mpeg4Movie, .quickTimeMovie, .html]
         if let webmType = UTType(filenameExtension: "webm") {
             contentTypes.append(webmType)
         }
         panel.allowedContentTypes = contentTypes
 
-        if panel.runModal() == .OK, let url = panel.url {
-            UserDefaults.standard.set(url.path, forKey: defaultsKey)
-            handleSelectedVideo(url: url)
+        if panel.runModal() == .OK {
+            let prevCount = playlist.count
+            for url in panel.urls {
+                if !playlist.contains(where: { $0.path == url.path }) {
+                    playlist.append(PlaylistItem(path: url.path))
+                }
+            }
+            if prevCount == 0 && !playlist.isEmpty {
+                currentIndex = 0
+            }
+            saveState()
+            rebuildMenu()
+            if !isPlaying || player == nil {
+                loadVideo(at: currentIndex)
+            }
         }
     }
 
-    // MARK: webm handling
+    @objc private func selectPlaylistItem(_ sender: NSMenuItem) {
+        guard let i = sender.representedObject as? Int, i < playlist.count else { return }
+        currentIndex = i
+        saveState()
+        loadVideo(at: currentIndex)
+        rebuildMenu()
+        resetSwitchTimer()
+    }
 
-    private func handleSelectedVideo(url: URL) {
-        if url.pathExtension.lowercased() == "webm" {
+    @objc private func removeCurrent() {
+        guard !playlist.isEmpty else { return }
+        playlist.remove(at: currentIndex)
+        if playlist.isEmpty {
+            currentIndex = 0
+            player?.replaceCurrentItem(with: nil)
+            looper = nil
+            isPlaying = false
+            hideWebView()
+            playerView.isHidden = false
+        } else {
+            if currentIndex >= playlist.count { currentIndex = playlist.count - 1 }
+            loadVideo(at: currentIndex)
+        }
+        saveState()
+        rebuildMenu()
+        resetSwitchTimer()
+    }
+
+    @objc private func clearPlaylist() {
+        playlist.removeAll()
+        currentIndex = 0
+        player?.replaceCurrentItem(with: nil)
+        looper = nil
+        isPlaying = false
+        hideWebView()
+        playerView.isHidden = false
+        saveState()
+        rebuildMenu()
+        switchTimer?.invalidate()
+        switchTimer = nil
+    }
+
+    // MARK: - Interval & shuffle
+
+    @objc private func setInterval(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? Int,
+              let interval = SwitchInterval(rawValue: raw) else { return }
+        switchInterval = interval
+        saveInterval()
+        rebuildMenu()
+        resetSwitchTimer()
+    }
+
+    @objc private func toggleShuffle() {
+        shuffle.toggle()
+        saveShuffle()
+        if shuffle {
+            generateShuffleOrder()
+        }
+        rebuildMenu()
+    }
+
+    private func generateShuffleOrder() {
+        guard playlist.count > 1 else { return }
+        shuffledOrder = Array(0..<playlist.count).shuffled()
+        // Make sure first item isn't current (unless only one)
+        if shuffledOrder.first == currentIndex, shuffledOrder.count > 1 {
+            shuffledOrder.swapAt(0, 1)
+        }
+        shuffleIndex = 0
+    }
+
+    // MARK: - Timer
+
+    private func resetSwitchTimer() {
+        switchTimer?.invalidate()
+        switchTimer = nil
+        guard switchInterval != .off, playlist.count > 1 else { return }
+        switchTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(switchInterval.rawValue), repeats: true) { [weak self] _ in
+            self?.nextTrack()
+        }
+    }
+
+    @objc private func nextTrack() {
+        guard playlist.count > 1 else { return }
+        if shuffle {
+            // Playlist edits invalidate the order; indices must stay in bounds
+            if shuffledOrder.count != playlist.count { generateShuffleOrder() }
+            currentIndex = shuffledOrder[shuffleIndex % shuffledOrder.count]
+            shuffleIndex += 1
+        } else {
+            currentIndex = (currentIndex + 1) % playlist.count
+        }
+        saveState()
+        loadVideo(at: currentIndex)
+        rebuildMenu()
+    }
+
+    // MARK: - Video loading
+
+    private func loadVideo(at index: Int) {
+        guard index < playlist.count else { return }
+        let item = playlist[index]
+        let url = URL(fileURLWithPath: item.path)
+
+        toggleMenuItem?.isEnabled = false
+
+        let ext = url.pathExtension.lowercased()
+        if ext == "html" || ext == "htm" {
+            showHTML(url: url)
+        } else if ext == "webm" {
             beginTranscoding(sourceURL: url)
         } else {
-            loadVideo(url: url)
+            playVideo(url: url)
         }
     }
+
+    // MARK: - HTML wallpaper
+
+    private func ensureWebView() -> WKWebView {
+        if let webView { return webView }
+        let config = WKWebViewConfiguration()
+        config.mediaTypesRequiringUserActionForPlayback = []
+        let wv = WallpaperWebView(frame: window.contentView?.bounds ?? .zero, configuration: config)
+        wv.autoresizingMask = [.width, .height]
+        wv.isHidden = true
+        window.contentView?.addSubview(wv)
+        webView = wv
+        return wv
+    }
+
+    private func showHTML(url: URL) {
+        let wv = ensureWebView()
+        // Grant read access to the folder so relative CSS/JS/image paths work
+        wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        wv.isHidden = false
+        playerView.isHidden = true
+
+        // Release the video pipeline while HTML is showing
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        looper = nil
+        isPlaying = true
+        showingHTML = true
+        updateMouseEventState()
+
+        toggleMenuItem?.isEnabled = false
+        toggleMenuItem?.title = "⏸ 일시정지"
+        nowPlayingItem?.title = nowPlayingText()
+    }
+
+    private func hideWebView() {
+        guard let webView else { return }
+        webView.isHidden = true
+        webView.loadHTMLString("", baseURL: nil) // stop JS/animation CPU usage
+        showingHTML = false
+        updateMouseEventState()
+    }
+
+    // Only intercept mouse events while an interactive HTML wallpaper is up;
+    // otherwise clicks must pass through to the Finder desktop.
+    // Finder's desktop-icon window sits above the desktop level and grabs all
+    // clicks (rubber-band selection), so interactive mode must also raise the
+    // window just above it — desktop icons are covered while this is on.
+    private func updateMouseEventState() {
+        let interactive = showingHTML && htmlInteraction
+        window.ignoresMouseEvents = !interactive
+        let level = interactive
+            ? Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
+            : Int(CGWindowLevelForKey(.desktopWindow))
+        window.level = NSWindow.Level(rawValue: level)
+    }
+
+    @objc private func toggleHTMLInteraction() {
+        htmlInteraction.toggle()
+        UserDefaults.standard.set(htmlInteraction, forKey: htmlInteractionKey)
+        updateMouseEventState()
+        rebuildMenu()
+    }
+
+    private func playVideo(url: URL) {
+        let asset = AVAsset(url: url)
+        let playableKey = "playable"
+        asset.loadValuesAsynchronously(forKeys: [playableKey]) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                var error: NSError?
+                let status = asset.statusOfValue(forKey: playableKey, error: &error)
+                if status == .loaded {
+                    self.hideWebView()
+                    self.playerView.isHidden = false
+                    let item = AVPlayerItem(asset: asset)
+                    let avPlayer = AVQueuePlayer()
+                    avPlayer.isMuted = true
+                    self.looper = AVPlayerLooper(player: avPlayer, templateItem: item)
+                    self.player = avPlayer
+                    self.playerView.playerLayer.player = avPlayer
+                    self.playerView.playerLayer.videoGravity = .resizeAspectFill
+                    avPlayer.play()
+                    self.isPlaying = true
+                    self.toggleMenuItem?.isEnabled = true
+                    self.toggleMenuItem?.title = "⏸ 일시정지"
+                    self.nowPlayingItem?.title = self.nowPlayingText()
+                } else {
+                    self.toggleMenuItem?.isEnabled = true
+                    self.showLoadError(url: url, error: error)
+                }
+            }
+        }
+    }
+
+    private func showLoadError(url: URL, error: Error?) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "비디오 로드 실패"
+        alert.informativeText = "\(url.lastPathComponent)를 불러올 수 없습니다.\n\(error?.localizedDescription ?? "알 수 없는 오류")"
+        alert.runModal()
+    }
+
+    // MARK: - webm handling
 
     private func beginTranscoding(sourceURL: URL) {
         toggleMenuItem?.isEnabled = false
         toggleMenuItem?.title = "webm 변환 중..."
+        nowPlayingItem?.title = "🔄 \(sourceURL.lastPathComponent) 변환중..."
 
         transcodeWebM(at: sourceURL) { [weak self] result in
             guard let self else { return }
             self.toggleMenuItem?.isEnabled = true
             switch result {
             case .success(let mp4URL):
-                self.loadVideo(url: mp4URL)
+                self.playVideo(url: mp4URL)
             case .failure(let error):
-                self.toggleMenuItem?.title = self.isPlaying ? "일시정지" : "재생"
+                self.toggleMenuItem?.title = self.isPlaying ? "⏸ 일시정지" : "▶ 재생"
                 self.showTranscodeError(error)
+                self.nowPlayingItem?.title = "❌ 변환 실패"
             }
         }
     }
@@ -260,27 +672,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func loadVideo(url: URL) {
-        let item = AVPlayerItem(url: url)
-        let player = AVQueuePlayer()
-        player.isMuted = true
-        looper = AVPlayerLooper(player: player, templateItem: item)
-        queuePlayer = player
-        playerView.playerLayer.player = player
-        playerView.playerLayer.videoGravity = .resizeAspectFill
-        player.play()
-        isPlaying = true
-        toggleMenuItem?.title = "일시정지"
-    }
+    // MARK: - Playback controls
 
     @objc private func togglePlayback() {
-        guard let player = queuePlayer else { return }
+        guard !showingHTML, let player = player else { return }
         if isPlaying {
             player.pause()
-            toggleMenuItem?.title = "재생"
+            toggleMenuItem?.title = "▶ 재생"
         } else {
             player.play()
-            toggleMenuItem?.title = "일시정지"
+            toggleMenuItem?.title = "⏸ 일시정지"
         }
         isPlaying.toggle()
     }
@@ -289,11 +690,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()
-                loginMenuItem?.state = .off
             } else {
                 try SMAppService.mainApp.register()
-                loginMenuItem?.state = .on
             }
+            rebuildMenu()
         } catch {
             NSLog("Failed to toggle launch-at-login: \(error)")
         }
