@@ -103,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var showingTerminal = false
     private var terminalModeEnabled = false
     private var shellRunning = false
+    private var terminalFontSize: CGFloat = 14
+    private let terminalFontSizes: [CGFloat] = [11, 12, 13, 14, 16, 18, 20, 24]
 
     private let playlistKey = "WallpaperPlaylist"
     private let currentIndexKey = "WallpaperCurrentIndex"
@@ -111,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let htmlInteractionKey = "WallpaperHTMLInteraction"
     private let muteKey = "WallpaperMuted"
     private let terminalModeKey = "WallpaperTerminalMode"
+    private let terminalFontSizeKey = "WallpaperTerminalFontSize"
 
     private var playlist: [PlaylistItem] = []
     private var currentIndex = 0
@@ -166,6 +169,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isMuted = UserDefaults.standard.bool(forKey: muteKey)
         }
         terminalModeEnabled = UserDefaults.standard.bool(forKey: terminalModeKey)
+        let savedSize = UserDefaults.standard.double(forKey: terminalFontSizeKey)
+        if savedSize > 0 { terminalFontSize = CGFloat(savedSize) }
     }
 
     private func saveState() {
@@ -249,6 +254,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalItem.target = self
         terminalItem.state = terminalModeEnabled ? .on : .off
         menu.addItem(terminalItem)
+
+        // Terminal font size submenu
+        let fontItem = NSMenuItem(title: "🔤 터미널 폰트 크기", action: nil, keyEquivalent: "")
+        let fontSub = NSMenu()
+        fontSub.autoenablesItems = false
+        for size in terminalFontSizes {
+            let item = NSMenuItem(title: "\(Int(size)) pt", action: #selector(setTerminalFontSize(_:)), keyEquivalent: "")
+            item.representedObject = size
+            item.state = size == terminalFontSize ? .on : .off
+            item.target = self
+            fontSub.addItem(item)
+        }
+        fontItem.submenu = fontSub
+        menu.addItem(fontItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -609,6 +628,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setTerminalMode(!terminalModeEnabled)
     }
 
+    @objc private func setTerminalFontSize(_ sender: NSMenuItem) {
+        guard let size = sender.representedObject as? CGFloat else { return }
+        terminalFontSize = size
+        UserDefaults.standard.set(Double(size), forKey: terminalFontSizeKey)
+        terminalView?.font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        rebuildMenu()
+    }
+
     private func setTerminalMode(_ on: Bool) {
         terminalModeEnabled = on
         UserDefaults.standard.set(on, forKey: terminalModeKey)
@@ -622,11 +649,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func ensureTerminalView() -> WallpaperTerminalView {
         if let terminalView { return terminalView }
-        let tv = WallpaperTerminalView(frame: window.contentView?.bounds ?? .zero)
+        // Inset from the screen edges so the rightmost column isn't clipped and
+        // the top rows aren't hidden under the menu bar
+        let bounds = window.contentView?.bounds ?? .zero
+        let frame = NSRect(x: bounds.minX + 18, y: bounds.minY + 12,
+                           width: bounds.width - 36, height: bounds.height - 36)
+        let tv = WallpaperTerminalView(frame: frame)
         tv.autoresizingMask = [.width, .height]
         tv.isHidden = true
         tv.processDelegate = self
-        tv.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        tv.font = NSFont.monospacedSystemFont(ofSize: terminalFontSize, weight: .regular)
         tv.nativeForegroundColor = NSColor(calibratedWhite: 0.86, alpha: 1)
         tv.nativeBackgroundColor = NSColor(calibratedWhite: 0.06, alpha: 1)
         window.contentView?.addSubview(tv)
