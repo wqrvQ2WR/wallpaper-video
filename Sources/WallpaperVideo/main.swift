@@ -4,12 +4,17 @@ import ServiceManagement
 import UniformTypeIdentifiers
 import CryptoKit
 import WebKit
+import SwiftTerm
 
 // MARK: - Desktop-level window that hosts the video
 
 final class DesktopWindow: NSWindow {
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
+    // Only allow key/main status while an interactive wallpaper (HTML/terminal)
+    // is up, so the terminal can receive keyboard input; a plain video
+    // wallpaper stays non-focusable and never steals focus.
+    var interactive = false
+    override var canBecomeKey: Bool { interactive }
+    override var canBecomeMain: Bool { interactive }
 }
 
 final class PlayerView: NSView {
@@ -33,6 +38,17 @@ final class PlayerView: NSView {
 // "first mouse" — accept it or clicks would be swallowed
 final class WallpaperWebView: WKWebView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+// Terminal wallpaper: same first-mouse handling, plus activate the (accessory)
+// app on click so keystrokes route to the shell
+final class WallpaperTerminalView: LocalProcessTerminalView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKey()
+        super.mouseDown(with: event)
+    }
 }
 
 enum TranscodeError: Error {
@@ -83,17 +99,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var webView: WKWebView?
     private var showingHTML = false
     private var htmlInteraction = true
+    private var terminalView: WallpaperTerminalView?
+    private var showingTerminal = false
+    private var terminalModeEnabled = false
+    private var shellRunning = false
 
     private let playlistKey = "WallpaperPlaylist"
     private let currentIndexKey = "WallpaperCurrentIndex"
     private let intervalKey = "WallpaperSwitchInterval"
     private let shuffleKey = "WallpaperShuffle"
     private let htmlInteractionKey = "WallpaperHTMLInteraction"
+    private let muteKey = "WallpaperMuted"
+    private let terminalModeKey = "WallpaperTerminalMode"
 
     private var playlist: [PlaylistItem] = []
     private var currentIndex = 0
     private var switchInterval: SwitchInterval = .off
     private var shuffle = false
+    private var isMuted = true
     private var switchTimer: Timer?
 
     private var shuffledOrder: [Int] = []
@@ -119,7 +142,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        if !playlist.isEmpty {
+        if terminalModeEnabled {
+            setTerminalMode(true)
+        } else if !playlist.isEmpty {
             loadVideo(at: currentIndex)
         }
     }
@@ -137,6 +162,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if UserDefaults.standard.object(forKey: htmlInteractionKey) != nil {
             htmlInteraction = UserDefaults.standard.bool(forKey: htmlInteractionKey)
         }
+        if UserDefaults.standard.object(forKey: muteKey) != nil {
+            isMuted = UserDefaults.standard.bool(forKey: muteKey)
+        }
+        terminalModeEnabled = UserDefaults.standard.bool(forKey: terminalModeKey)
     }
 
     private func saveState() {
@@ -152,6 +181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func saveShuffle() {
         UserDefaults.standard.set(shuffle, forKey: shuffleKey)
+    }
+
+    private func saveMute() {
+        UserDefaults.standard.set(isMuted, forKey: muteKey)
     }
 
     // MARK: - Status bar menu
@@ -205,6 +238,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         interactionItem.target = self
         interactionItem.state = htmlInteraction ? .on : .off
         menu.addItem(interactionItem)
+
+        // Mute toggle
+        let muteItem = NSMenuItem(title: isMuted ? "🔇 음소거 켜짐" : "🔊 소리 켜짐", action: #selector(toggleMute), keyEquivalent: "m")
+        muteItem.target = self
+        menu.addItem(muteItem)
+
+        // Terminal wallpaper toggle
+        let terminalItem = NSMenuItem(title: "🖥 터미널 배경화면", action: #selector(toggleTerminal), keyEquivalent: "t")
+        terminalItem.target = self
+        terminalItem.state = terminalModeEnabled ? .on : .off
+        menu.addItem(terminalItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -279,6 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func nowPlayingText() -> String {
+        if showingTerminal { return "🖥 터미널 배경화면" }
         guard !playlist.isEmpty else { return "🎬 선택된 영상 없음" }
         let name = playlist[currentIndex].name
         let total = playlist.count
@@ -499,7 +544,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         looper = nil
         isPlaying = true
         showingHTML = true
-        updateMouseEventState()
+        hideTerminalSurface()
+        updateInteractionState()
 
         toggleMenuItem?.isEnabled = false
         toggleMenuItem?.title = "⏸ 일시정지"
@@ -511,27 +557,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         webView.isHidden = true
         webView.loadHTMLString("", baseURL: nil) // stop JS/animation CPU usage
         showingHTML = false
-        updateMouseEventState()
+        updateInteractionState()
     }
 
-    // Only intercept mouse events while an interactive HTML wallpaper is up;
-    // otherwise clicks must pass through to the Finder desktop.
+    // Hide the terminal because a video/HTML surface is taking over. Turns the
+    // persisted mode off too, since the user is explicitly choosing a wallpaper.
+    private func hideTerminalSurface() {
+        guard showingTerminal || terminalModeEnabled else { return }
+        terminalView?.isHidden = true
+        showingTerminal = false
+        if terminalModeEnabled {
+            terminalModeEnabled = false
+            UserDefaults.standard.set(false, forKey: terminalModeKey)
+        }
+    }
+
+    // Only intercept mouse/keyboard while an interactive wallpaper (HTML with
+    // interaction on, or the terminal) is up; otherwise clicks must pass through
+    // to the Finder desktop.
     // Finder's desktop-icon window sits above the desktop level and grabs all
     // clicks (rubber-band selection), so interactive mode must also raise the
     // window just above it — desktop icons are covered while this is on.
-    private func updateMouseEventState() {
-        let interactive = showingHTML && htmlInteraction
+    private func updateInteractionState() {
+        let interactive = showingTerminal || (showingHTML && htmlInteraction)
         window.ignoresMouseEvents = !interactive
+        window.interactive = interactive
         let level = interactive
             ? Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
             : Int(CGWindowLevelForKey(.desktopWindow))
         window.level = NSWindow.Level(rawValue: level)
+
+        if showingTerminal, let tv = terminalView {
+            // Route keyboard to the shell: activate the accessory app, make the
+            // desktop window key, and focus the terminal view
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(tv)
+        }
     }
 
     @objc private func toggleHTMLInteraction() {
         htmlInteraction.toggle()
         UserDefaults.standard.set(htmlInteraction, forKey: htmlInteractionKey)
-        updateMouseEventState()
+        updateInteractionState()
+        rebuildMenu()
+    }
+
+    // MARK: - Terminal wallpaper
+
+    @objc private func toggleTerminal() {
+        setTerminalMode(!terminalModeEnabled)
+    }
+
+    private func setTerminalMode(_ on: Bool) {
+        terminalModeEnabled = on
+        UserDefaults.standard.set(on, forKey: terminalModeKey)
+        if on {
+            showTerminal()
+        } else {
+            hideTerminalAndRestore()
+        }
+        rebuildMenu()
+    }
+
+    private func ensureTerminalView() -> WallpaperTerminalView {
+        if let terminalView { return terminalView }
+        let tv = WallpaperTerminalView(frame: window.contentView?.bounds ?? .zero)
+        tv.autoresizingMask = [.width, .height]
+        tv.isHidden = true
+        tv.processDelegate = self
+        tv.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        tv.nativeForegroundColor = NSColor(calibratedWhite: 0.86, alpha: 1)
+        tv.nativeBackgroundColor = NSColor(calibratedWhite: 0.06, alpha: 1)
+        window.contentView?.addSubview(tv)
+        terminalView = tv
+        return tv
+    }
+
+    private func startShell(_ tv: WallpaperTerminalView) {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        // Login shell so ~/.zprofile etc. are sourced; start in the home dir
+        tv.startProcess(executable: shell, args: ["-l"], currentDirectory: home)
+        shellRunning = true
+    }
+
+    private func showTerminal() {
+        let tv = ensureTerminalView()
+
+        // Take over the screen from any video/HTML surface
+        player?.pause()
+        isPlaying = false
+        hideWebView()
+        playerView.isHidden = true
+        switchTimer?.invalidate()
+        switchTimer = nil
+
+        if !shellRunning {
+            startShell(tv)
+        }
+        tv.isHidden = false
+        showingTerminal = true
+        updateInteractionState()
+
+        toggleMenuItem?.isEnabled = false
+        nowPlayingItem?.title = nowPlayingText()
+    }
+
+    private func hideTerminalAndRestore() {
+        terminalView?.isHidden = true
+        showingTerminal = false
+        updateInteractionState()
+
+        // Return to the playlist wallpaper
+        if playlist.isEmpty {
+            playerView.isHidden = false
+        } else {
+            loadVideo(at: currentIndex)
+            resetSwitchTimer()
+        }
+    }
+
+    @objc private func toggleMute() {
+        isMuted.toggle()
+        saveMute()
+        player?.isMuted = isMuted
         rebuildMenu()
     }
 
@@ -544,11 +694,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 var error: NSError?
                 let status = asset.statusOfValue(forKey: playableKey, error: &error)
                 if status == .loaded {
+                    self.hideTerminalSurface()
                     self.hideWebView()
                     self.playerView.isHidden = false
                     let item = AVPlayerItem(asset: asset)
                     let avPlayer = AVQueuePlayer()
-                    avPlayer.isMuted = true
+                    avPlayer.isMuted = self.isMuted
                     self.looper = AVPlayerLooper(player: avPlayer, templateItem: item)
                     self.player = avPlayer
                     self.playerView.playerLayer.player = avPlayer
@@ -696,6 +847,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rebuildMenu()
         } catch {
             NSLog("Failed to toggle launch-at-login: \(error)")
+        }
+    }
+}
+
+// MARK: - Terminal process delegate
+
+extension AppDelegate: LocalProcessTerminalViewDelegate {
+    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+
+    func processTerminated(source: TerminalView, exitCode: Int32?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.shellRunning = false
+            // `exit` at the prompt closes the terminal wallpaper; re-enabling
+            // it from the menu starts a fresh shell
+            guard self.showingTerminal else { return }
+            self.setTerminalMode(false)
         }
     }
 }
